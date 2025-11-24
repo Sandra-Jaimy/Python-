@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""
+flight_parser.py
+
+Python Final Assignment: Flight Schedule Parser and Query Tool
+
+Usage examples:
+  python flight_parser.py -i data/db.csv
+  python flight_parser.py -d data/flights/ -o output/db.json
+  python flight_parser.py -j data/db.json -q data/query.json
+
+Produces:
+  - db.json (valid flights) or custom -o path
+  - errors.txt (validation errors and ignored comment lines)
+  - response_<studentid>_<name>_<lastname>_<YYYYMMDD_HHMM>.json when -q used
+
+Student: 241ADB123, Sandra Jaimy
+"""
+
+import argparse
+import csv
+import json
+import os
+import re
+from datetime import datetime
+from typing import List, Dict, Any, Tuple
+
+STUDENT_ID = "241ADB123"
+STUDENT_FIRST = "Sandra"
+STUDENT_LAST = "Jaimy"
+DATETIME_FMT = "%Y-%m-%d %H:%M"
+
+# Validation helpers
+RE_FLIGHT_ID = re.compile(r'^[A-Za-z0-9]{2,8}$')
+RE_AIRPORT = re.compile(r'^[A-Z]{3}$')
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Flight Schedule Parser and Query Tool")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument('-i', '--input', help='Parse a single CSV file.')
+    group.add_argument('-d', '--dir', help='Parse all .csv files in a folder and combine results.')
+    p.add_argument('-o', '--output', help='Optional custom output path for valid flights JSON. Default: db.json', default='db.json')
+    p.add_argument('-j', '--json', help='Load existing JSON database instead of parsing CSVs.')
+    p.add_argument('-q', '--query', help='Execute queries defined in a JSON file on the loaded database.')
+    return p.parse_args()
+
+
+def read_csv_lines(path: str) -> List[Tuple[int, str]]:
+    """Return list of (line_no, raw_line) from file, preserving lines (so comments/blank lines visible).
+    Line numbers start at 1.
+    """
+    lines = []
+    with open(path, 'r', encoding='utf-8') as f:
+        for i, raw in enumerate(f, start=1):
+            lines.append((i, raw.rstrip('\n')))
+    return lines
+
+
+def validate_row_values(values: List[str]) -> List[str]:
+    """Given split CSV fields (raw strings), return list of validation error messages (empty if valid).
+    Expected fields: flight_id,origin,destination,departure_datetime,arrival_datetime,price
+    """
+    errors = []
+    if len(values) != 6:
+        errors.append('missing required fields')
+        return errors
+
+    flight_id, origin, destination, dep_dt, arr_dt, price = [v.strip() for v in values]
+
+    # flight_id
+    if not flight_id:
+        errors.append('missing flight_id')
+    elif not RE_FLIGHT_ID.match(flight_id):
+        if len(flight_id) < 2 or len(flight_id) > 8:
+            errors.append('flight_id length must be 2-8 alphanumeric characters')
+        else:
+            errors.append('flight_id contains invalid characters')
+
+    # origin
+    if not origin:
+        errors.append('missing origin field')
+    elif not RE_AIRPORT.match(origin):
+        errors.append('invalid origin code')
+
+    # destination
+    if not destination:
+        errors.append('missing destination field')
+    elif not RE_AIRPORT.match(destination):
+        errors.append('invalid destination code')
+
+    # datetimes
+    dep_dt_obj = None
+    arr_dt_obj = None
+    try:
+        dep_dt_obj = datetime.strptime(dep_dt, DATETIME_FMT)
+    except Exception:
+        errors.append('invalid departure datetime')
+    try:
+        arr_dt_obj = datetime.strptime(arr_dt, DATETIME_FMT)
+    except Exception:
+        errors.append('invalid arrival datetime')
+
+    if dep_dt_obj and arr_dt_obj:
+        if arr_dt_obj <= dep_dt_obj:
+            errors.append('arrival before or equal to departure')
+
+    # price
+    try:
+        p = float(price)
+        if p <= 0:
+            errors.append('price must be positive')
+    except Exception:
+        errors.append('invalid price value')
+
+    return errors
+
+
+def parse_csv_file(path: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Parse a single CSV file. Returns (valid_records, error_lines)
+    error_lines are strings suitable for writing to errors.txt
+    """
+    valid = []
+    errors = []
+    lines = read_csv_lines(path)
+
+    for lineno, raw in lines:
+        if not raw.strip():
+            # ignore blank lines silently
+            continue
+        if raw.strip().startswith('#'):
+            errors.append(f'Line {lineno}: {raw} -> comment line, ignored for data parsing')
+            continue
+
+        # Use csv.reader to correctly split commas, but we already have raw line
+        try:
+            reader = csv.reader([raw])
+            fields = next(reader)
+        except Exception as e:
+            errors.append(f'Line {lineno}: {raw} -> CSV parse error: {e}')
+            continue
+
+        val_errors = validate_row_values(fields)
+        if val_errors:
+            errors.append(f'Line {lineno}: {raw} -> {", ".join(val_errors)}')
+            continue
+
+        # At this point the row is valid — normalize and append
+        flight_id, origin, destination, dep_dt, arr_dt, price = [v.strip() for v in fields]
+        rec = {
+            'flight_id': flight_id,
+            'origin': origin,
+            'destination': destination,
+            'departure_datetime': dep_dt,
+            'arrival_datetime': arr_dt,
+            'price': float(price)
+        }
+        valid.append(rec)
+
+    return valid, errors
+
+
+def combine_and_parse_folder(folder: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    all_valid = []
+    all_errors = []
+    if not os.path.isdir(folder):
+        raise FileNotFoundError(f'Folder not found: {folder}')
+    for fname in sorted(os.listdir(folder)):
+        if not fname.lower().endswith('.csv'):
+            continue
+        path = os.path.join(folder, fname)
+        v, e = parse_csv_file(path)
+        # annotate errors with filename if multiple files
+        if len([f for f in os.listdir(folder) if f.lower().endswith('.csv')]) > 1:
+            # include filename inside message for clarity
+            e = [f'{fname} - {msg}' for msg in e]
+        all_valid.extend(v)
+        all_errors.extend(e)
+    return all_valid, all_errors
+
+
+def write_json(path: str, data: Any):
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def write_errors(path: str, errors: List[str]):
+    with open(path, 'w', encoding='utf-8') as f:
+        for line in errors:
+            f.write(line + '\n')
+
+
+def load_json_db(path: str) -> List[Dict[str, Any]]:
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    # Basic validation: ensure it's a list of dicts with required keys
+    if not isinstance(data, list):
+        raise ValueError('JSON database must be an array of flight objects')
+    return data
+
+
+def matches_query(f: Dict[str, Any], q: Dict[str, Any]) -> bool:
+    # Exact matches
+    for key in ('flight_id', 'origin', 'destination'):
+        if key in q:
+            if f.get(key) != q[key]:
+                return False
+
+    # Datetime filters
+    try:
+        if 'departure_datetime' in q:
+            qdep = datetime.strptime(q['departure_datetime'], DATETIME_FMT)
+            fdep = datetime.strptime(f['departure_datetime'], DATETIME_FMT)
+            if fdep < qdep:
+                return False
+        if 'arrival_datetime' in q:
+            qarr = datetime.strptime(q['arrival_datetime'], DATETIME_FMT)
+            farr = datetime.strptime(f['arrival_datetime'], DATETIME_FMT)
+            if farr > qarr:
+                return False
+    except Exception:
+        # If query datetime has invalid format, treat as non-matching
+        return False
+
+    # Price filter: include flights with price <= given value
+    if 'price' in q:
+        try:
+            qprice = float(q['price'])
+            if float(f.get('price', float('inf'))) > qprice:
+                return False
+        except Exception:
+            return False
+
+    return True
+
+
+def run_queries(db: List[Dict[str, Any]], query_file: str) -> List[Dict[str, Any]]:
+    with open(query_file, 'r', encoding='utf-8') as f:
+        q_raw = json.load(f)
+    queries = q_raw if isinstance(q_raw, list) else [q_raw]
+    responses = []
+    for q in queries:
+        matches = [f for f in db if matches_query(f, q)]
+        responses.append({'query': q, 'matches': matches})
+    return responses
+
+
+def timestamp_now_str():
+    return datetime.now().strftime('%Y%m%d_%H%M')
+
+
+def main():
+    args = parse_args()
+
+    # Decide data source
+    db = []
+    errors_collected = []
+
+    if args.json:
+        # Load JSON database instead of parsing
+        try:
+            db = load_json_db(args.json)
+            print(f'Loaded database from {args.json} ({len(db)} records)')
+        except Exception as e:
+            print(f'Failed to load JSON database: {e}')
+            return
+    else:
+        # Parse from CSV input or folder
+        if args.input:
+            if not os.path.isfile(args.input):
+                print(f'Input file not found: {args.input}')
+                return
+            valid, errors = parse_csv_file(args.input)
+            db = valid
+            errors_collected = errors
+            print(f'Parsed {len(valid)} valid flights from {args.input}, {len(errors)} issues')
+        elif args.dir:
+            try:
+                valid, errors = combine_and_parse_folder(args.dir)
+            except Exception as e:
+                print(f'Failed to parse folder: {e}')
+                return
+            db = valid
+            errors_collected = errors
+            print(f'Parsed {len(valid)} valid flights from folder {args.dir}, {len(errors)} issues')
+        else:
+            print('No data source specified. Use -i, -d, or -j. See -h for help.')
+            return
+
+        # Write db.json (or custom path) and errors.txt
+        out_db_path = args.output
+        try:
+            write_json(out_db_path, db)
+            print(f'Wrote {len(db)} valid records to {out_db_path}')
+        except Exception as e:
+            print(f'Failed to write JSON output: {e}')
+
+        err_path = 'errors.txt'
+        try:
+            write_errors(err_path, errors_collected)
+            print(f'Wrote {len(errors_collected)} error/comment lines to {err_path}')
+        except Exception as e:
+            print(f'Failed to write errors.txt: {e}')
+
+    # If user requested queries, run them
+    if args.query:
+        if not os.path.isfile(args.query):
+            print(f'Query file not found: {args.query}')
+            return
+        # ensure db is loaded (if -j used earlier, db is already set; if -i/-d used we saved db to args.output and loaded it into memory)
+        if not db:
+            # try to load from output file
+            try:
+                db = load_json_db(args.output)
+                print(f'Loaded database from {args.output} for query execution')
+            except Exception as e:
+                print('No database available to query. Provide -j or parse CSVs with -i/-d first.')
+                return
+        try:
+            responses = run_queries(db, args.query)
+        except Exception as e:
+            print(f'Failed to run queries: {e}')
+            return
+
+        outname = f'response_{STUDENT_ID}_{STUDENT_FIRST}_{STUDENT_LAST}_{timestamp_now_str()}.json'
+        try:
+            write_json(outname, responses)
+            print(f'Wrote query responses to {outname}')
+        except Exception as e:
+            print(f'Failed to write response file: {e}')
+
+
+if __name__ == '__main__':
+    main()
